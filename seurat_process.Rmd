@@ -1,0 +1,249 @@
+---
+title: "412 Project - Seurat Processing"
+author: "Kristi Lin-Rahardja"
+date: "5/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup .{tabset}
+
+## Libraries
+
+```{r setup, include=FALSE}
+library(useful); library(devtools)
+library(Seurat); library(Matrix); library(clustree)
+library(tidyverse); library(dplyr)
+library(ggplot2); library(ggridges); library(gridExtra)
+```
+
+## Load data
+
+Set the full path to the main directory 
+```{r set wd path}
+rm(list=ls())
+dir <- "/Users/link7/Documents/412/412_proj/"
+```
+
+Load data
+```{r load data}
+raw.data <- read.csv(paste(dir,"csv_files/S01_datafinal.csv", sep=""), header=T, row.names = 1)
+dim(raw.data)
+head(colnames(raw.data))
+```
+
+Load metadata
+```{r load metadata}
+metadata <- read.csv(paste(dir,"csv_files/S01_metacells.csv", sep=""), row.names=1, header=T)
+head(metadata)
+```
+
+Save both objects as RData object for quicker loading 
+```{r save object}
+save(list=c("metadata","raw.data","dir"), file=paste(dir,"objects/S01_Data_and_metadata.RData", sep=""))
+```
+
+
+# Data Preparation .{tabset}
+
+## Create Seurat Object
+
+load and clean raw data
+```{r}
+osi.raw.data <- read.csv(paste(dir,"csv_files/neo-osi_rawdata.csv", sep=""), row.names = 1)
+colnames(osi.raw.data) <- gsub("_S.*.homo", "", colnames(osi.raw.data))
+head(osi.raw.data)
+tail(osi.raw.data)
+# drop sequencing details from gene count table
+row.names(osi.raw.data)[grep("__", row.names(osi.raw.data))]
+osi.raw.data <- osi.raw.data[-grep("__", row.names(osi.raw.data)),]
+```
+
+Make osi.metadata by cell from osi.metadata by plate
+```{r}
+osi.metadata <- read.csv(paste(dir, "csv_files/neo-osi_metadata.csv", sep = ""))
+osi.meta.cell <- as.data.frame(colnames(osi.raw.data))
+osi.meta.cell <- data.frame(do.call('rbind', strsplit(as.character(osi.meta.cell$`colnames(osi.raw.data)`),'_',fixed=TRUE)))
+rownames(osi.meta.cell) <- paste(osi.meta.cell$X1, osi.meta.cell$X2, sep = "_")
+colnames(osi.meta.cell) <- c("well", "plate")
+osi.meta.cell$cell_id <- rownames(osi.meta.cell)
+osi.metadata <- left_join(osi.meta.cell, osi.metadata, by = "plate")
+rownames(osi.metadata) <- osi.metadata$cell_id
+head(osi.metadata)
+unique(osi.metadata$plate)
+```
+
+Find ERCC's, compute the percent ERCC, and drop them from the raw data.
+```{r}
+erccs <- grep(pattern = "^ERCC-", x = rownames(x = osi.raw.data), value = TRUE)
+percent.ercc <- Matrix::colSums(osi.raw.data[erccs, ])/Matrix::colSums(osi.raw.data)
+ercc.index <- grep(pattern = "^ERCC-", x = rownames(x = osi.raw.data), value = FALSE)
+osi.raw.data <- osi.raw.data[-ercc.index,]
+dim(osi.raw.data)
+```
+
+Create the Seurat object with all the data (unfiltered)
+```{r}
+osi_object <- CreateSeuratObject(counts = osi.raw.data)
+osi_object <- AddMetaData(object = osi_object, metadata = osi.metadata)
+osi_object <- AddMetaData(object = osi_object, percent.ercc, col.name = "percent.ercc")
+# Changing nUMI column name to nReads
+colnames(osi_object@meta.data)[colnames(osi_object@meta.data) == 'nUMI'] <- 'nReads'
+head(osi_object@meta.data)
+```
+
+
+Filter cells so that remaining cells have nGenes >= 500 and nReads >= 50000
+```{r}
+osi_object_filtered <- subset(x=osi_object, subset = nCount_RNA > 50000 & nFeature_RNA > 500)
+osi_object_filtered
+osi_object_filtered
+```
+
+```{r}
+VlnPlot(osi_object_filtered, features = "nFeature_RNA")
+VlnPlot(osi_object_filtered, features = "nCount_RNA", log = TRUE)
+```
+
+
+
+# Subset .{tabset}
+
+## Clean
+
+```{r}
+load(file=paste(dir,"objects/S03_Merged_main_filtered_with_neo_osi.RData", sep=""))
+```
+
+Drop any samples with 10 or less cells
+```{r}
+main_tiss_filtered1@meta.data$sample_name <- as.character(main_tiss_filtered1@meta.data$sample_name)
+sample_name <- as.character(main_tiss_filtered1@meta.data$sample_name)
+# Make table 
+tab.1 <- table(main_tiss_filtered1@meta.data$sample_name) 
+# Which samples have less than 10 cells 
+samples.keep <- names(which(tab.1 > 10))
+metadata_keep <- filter(main_tiss_filtered1@meta.data, sample_name %in% samples.keep)
+# Subset Seurat object 
+tiss_subset <- subset(main_tiss_filtered1, cells=as.character(metadata_keep$cell_id))
+tiss_subset
+```
+
+Check sample and patient counts
+```{r}
+table(tiss_subset@meta.data$sample_name)
+table(tiss_subset@meta.data$patient_id)
+```
+
+Normalize and scale the data
+```{r}
+tiss_subset <- NormalizeData(object = tiss_subset, scale.factor = 1e6)
+tiss_subset <- ScaleData(object = tiss_subset)
+```
+
+Find variable genes
+```{r}
+tiss_subset <- FindVariableFeatures(object = tiss_subset)
+```
+
+# Dimensionality Reduction .{tabset}
+
+## PCA
+
+Perform PCA
+```{r}
+tiss_subset <- RunPCA(object = tiss_subset, do.print = FALSE)
+```
+
+Visualize variance along each component
+```{r}
+ElbowPlot(tiss_subset)
+```
+
+Visualize first two PCs
+```{r}
+DimPlot(tiss_subset, reduction = 'pca')
+```
+
+Visualize top genes and their loadings 
+```{r}
+VizDimLoadings(tiss_subset, dims = 1:4, reduction = "pca", nfeatures = 10)
+```
+
+Visualize top genes in principal components
+```{r}
+DimHeatmap(tiss_subset, dims = 1:7, cells = 100, balanced = TRUE)
+```
+
+Set nPCs from above visualizations
+```{r}
+n.pcs <- 20
+```
+
+Construct Neighbor graph
+```{r}
+tiss_subset <- FindNeighbors(object = tiss_subset, dims = 1:20, verbose = T)
+```
+
+Find Clusters 
+```{r}
+tiss_subset <- FindClusters(object = tiss_subset, verbose = T, resolution = 0.5)
+```
+
+## tSNE
+
+Run and project TSNEs
+```{r}
+tiss_subset <- RunTSNE(tiss_subset, dims = 1:15)
+DimPlot(tiss_subset, reduction = "tsne", label = TRUE)
+```
+
+Construct Neighbor graph 
+```{r}
+tiss_subset <- FindNeighbors(object = tiss_subset, dims = 1:20, verbose = T)
+```
+
+Find Clusters 
+```{r}
+tiss_subset <- FindClusters(object = tiss_subset, verbose = T, resolution = 0.5)
+```
+
+
+
+
+# Marker Expression Analysis .{tabset}
+
+## Visualize
+
+```{r}
+#tsne + pca showing how tx history spreads across clusters
+p = TSNEPlot(object = tiss_subset, group.by = 'treatment_history')
+ggsave(paste(dir,"plot_out/mine/tsne_tx.png", sep=""), p, width = 10, height = 10)
+
+p = DimPlot(tiss_subset, reduction = 'pca', group.by = "treatment_history")
+ggsave(paste(dir,"plot_out/mine/pca_tx.png", sep=""), p, width = 10, height = 10)
+
+
+#define what markers we want to observe
+features <- c(#"MDM2", "CCND1", "MTOR")  #survival/proliferation pathways
+              #"TLR2", "TLR4", "IRF3") #TLR pathway; proinflammation
+              #"BAD", "BID", "BAX", "FADD", "CRADD", "APAF1") #apoptosis markers https://www.rndsystems.com/pathways/apoptosis-signaling-pathway
+              #"CD27", "CD40", "CD28", "ICOS") #immune stimulatory checkpoint molecules
+              "CTLA4", "BTLA", "LAG3", "SIGLEC7") #inhibitory checkpoint molecules
+for (i in 1:length(features)){ #loop through the features to make the next plots individually per gene
+  #tsne highlighting expression of certain markers
+  p=FeaturePlot(tiss_subset, features = features[i], split.by = "treatment_history")
+  ggsave(paste(dir,"plot_out/mine/", features[i], "_featplot.png", sep=""), p, width = 15, height = 7)
+
+  
+  #expression in clusters, comparing naive vs prior tx
+  p=RidgePlot(tiss_subset, features = features[i], group.by= "treatment_history")
+  ggsave(paste(dir,"plot_out/mine/", features[i], "_tx_ridge.png", sep=""), p, width = 15, height = 7)
+  
+  VlnPlot(tiss_subset, features = features[i], group.by= "treatment_history")#,split.by = "treatment_history")
+  ggsave(paste(dir,"plot_out/mine/", features[i], "_tx_vln.png", sep=""), p, width = 15, height = 7)
+}
+```
